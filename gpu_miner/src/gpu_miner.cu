@@ -5,23 +5,28 @@
 #include <stdlib.h>
 #include <inttypes.h>
 
-// TODO: Implement function to search for all nonces from 1 through MAX_NONCE (inclusive) using CUDA Threads
 __global__ void findNonce(BYTE *difficulty, BYTE *block_content, size_t current_length, uint32_t *nonce) {
+	// Calculating the thread_id
 	uint32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x + 1;
+
+	// Checking if the thread_id is within the range and the nonce is not already found
 	if (thread_id > MAX_NONCE || *nonce != 0) {
 		return;
 	}
 
 	char nonce_string[NONCE_SIZE];
 	BYTE my_block_content[BLOCK_SIZE];
-	intToString(thread_id, nonce_string);
-	d_strcpy((char*)my_block_content, (char*)block_content);
-	d_strcpy((char*)my_block_content + current_length, nonce_string);
-
 	BYTE block_hash[SHA256_HASH_SIZE];
 
+	// Copying the block_content locally to avoid being overwritten by other threads
+	d_strcpy((char*)my_block_content, (char*)block_content);
+
+	// Computing the hash similar to the CPU code
+	intToString(thread_id, nonce_string);
+	d_strcpy((char*)my_block_content + current_length, nonce_string);
 	apply_sha256(my_block_content, d_strlen((const char*)my_block_content), block_hash, 1);
 
+	// Comparing the hash with the difficulty
 	if (compare_hashes(block_hash, difficulty) <= 0) {
 		*nonce = thread_id;
 	}
@@ -58,6 +63,7 @@ int main(int argc, char **argv) {
 	cudaEvent_t start, stop;
 	startTiming(&start, &stop);
 
+	// Computing the required number of blocks for the given number of threads
 	int threadsPerBlock = 512;
 	int blocks = (int)(MAX_NONCE) / threadsPerBlock;
 
@@ -65,6 +71,7 @@ int main(int argc, char **argv) {
 		blocks++;
 	}
 
+	// Copying the block_content, difficulty to the device
 	BYTE *device_block_content;
 	cudaMalloc(&device_block_content, BLOCK_SIZE);
 	cudaMemcpy(device_block_content, block_content, BLOCK_SIZE, cudaMemcpyHostToDevice);
@@ -73,28 +80,25 @@ int main(int argc, char **argv) {
 	cudaMalloc(&difficulty, SHA256_HASH_SIZE);
 	cudaMemcpy(difficulty, DIFFICULTY, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
 
+	// Creating a device variable to store the nonce
 	uint32_t *device_nonce;
 	cudaMalloc(&device_nonce, sizeof(uint32_t));
 	cudaMemset(device_nonce, 0, sizeof(uint32_t));
 
 	findNonce<<<blocks, threadsPerBlock>>>(difficulty, device_block_content, current_length, device_nonce);
-
 	cudaDeviceSynchronize();
 
-	char nonce_string[NONCE_SIZE];
+	// Copying the nonce from the device to the host
 	cudaMemcpy(&nonce, device_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+	// Applying sha256 to the block_content with the found nonce
+	char nonce_string[NONCE_SIZE];
 	sprintf(nonce_string, "%u", nonce);
 	strcpy((char*)block_content + current_length, nonce_string);
 	apply_sha256(block_content, strlen((const char*)block_content), block_hash, 1);
 	
 	float seconds = stopTiming(&start, &stop);
 	printResult(block_hash, nonce, seconds);
-
-	cudaError_t error = cudaGetLastError();
-	if (error != cudaSuccess) {
-		fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(error));
-		return 1;
-	}
 
 	cudaFree(device_block_content);
 	cudaFree(difficulty);
